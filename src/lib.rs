@@ -58,6 +58,7 @@ use std::convert::TryFrom;
 use std::fmt::{Debug, Display};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 const COMPATIBILITY_MATRIX: [u8; 121] = [
     // PAIR, PUB, SUB, REQ, REP, DEALER, ROUTER, PULL, PUSH, XPUB, XSUB
@@ -175,14 +176,35 @@ pub enum SocketEvent {
     Disconnected(PeerIdentity),
 }
 
-#[derive(Default)]
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct SocketOptions {
     pub(crate) peer_id: Option<PeerIdentity>,
+    pub(crate) connect_timeout: Option<Duration>,
+}
+
+impl Default for SocketOptions {
+    fn default() -> Self {
+        Self {
+            peer_id: None,
+            connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
+        }
+    }
 }
 
 impl SocketOptions {
     pub fn peer_identity(&mut self, peer_id: PeerIdentity) -> &mut Self {
         self.peer_id = Some(peer_id);
+        self
+    }
+
+    pub fn connect_timeout(&mut self, timeout: Duration) -> &mut Self {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
+    pub fn no_connect_timeout(&mut self) -> &mut Self {
+        self.connect_timeout = None;
         self
     }
 }
@@ -302,9 +324,15 @@ pub trait Socket: Sized + Send {
     async fn connect(&mut self, endpoint: &str) -> ZmqResult<()> {
         let backend = self.backend();
         let endpoint = TryIntoEndpoint::try_into(endpoint)?;
+        let connect_timeout = backend.socket_options().connect_timeout;
 
-        let (socket, endpoint) = util::connect_forever(endpoint).await?;
-        let peer_id = util::peer_connected(socket, backend).await?;
+        let (socket, endpoint, peer_id) = util::run_with_timeout(connect_timeout, async {
+            let (mut socket, endpoint) = util::connect_forever(endpoint).await?;
+            let peer_id = util::peer_handshake(&mut socket, backend.clone()).await?;
+            Ok((socket, endpoint, peer_id))
+        })
+        .await?;
+        backend.peer_connected(&peer_id, socket).await;
 
         if let Some(monitor) = self.backend().monitor().lock().as_mut() {
             let _ = monitor.try_send(SocketEvent::Connected(endpoint, peer_id));

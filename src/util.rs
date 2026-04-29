@@ -7,9 +7,12 @@ use futures::{SinkExt, StreamExt};
 use rand::Rng;
 
 use std::convert::{TryFrom, TryInto};
+use std::future::Future;
+use std::io::ErrorKind;
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Hash, Clone)]
@@ -189,16 +192,48 @@ pub(crate) async fn peer_connected(
     mut raw_socket: FramedIo,
     backend: Arc<dyn MultiPeerBackend>,
 ) -> ZmqResult<PeerIdentity> {
-    greet_exchange(&mut raw_socket).await?;
+    let peer_id = peer_handshake(&mut raw_socket, backend.clone()).await?;
+    backend.peer_connected(&peer_id, raw_socket).await;
+    Ok(peer_id)
+}
+
+pub(crate) async fn peer_handshake(
+    raw_socket: &mut FramedIo,
+    backend: Arc<dyn MultiPeerBackend>,
+) -> ZmqResult<PeerIdentity> {
+    greet_exchange(raw_socket).await?;
     let mut props = None;
     if let Some(identity) = &backend.socket_options().peer_id {
         let mut connect_ops = HashMap::new();
         connect_ops.insert("Identity".to_string(), identity.clone().into());
         props = Some(connect_ops);
     }
-    let peer_id = ready_exchange(&mut raw_socket, backend.socket_type(), props).await?;
-    backend.peer_connected(&peer_id, raw_socket).await;
-    Ok(peer_id)
+    ready_exchange(raw_socket, backend.socket_type(), props).await
+}
+
+pub(crate) async fn run_with_timeout<T, F>(duration: Option<Duration>, future: F) -> ZmqResult<T>
+where
+    F: Future<Output = ZmqResult<T>>,
+{
+    match duration {
+        Some(duration) => match async_rt::task::timeout(duration, future).await {
+            Ok(result) => result,
+            Err(_) => Err(ZmqError::ConnectTimeout(duration)),
+        },
+        None => future.await,
+    }
+}
+
+fn is_retryable_connect_error(endpoint: &Endpoint, error: &ZmqError) -> bool {
+    match error {
+        ZmqError::Network(error) if error.kind() == ErrorKind::ConnectionRefused => true,
+        ZmqError::Network(error)
+            if endpoint.transport() == Transport::Ipc && error.kind() == ErrorKind::NotFound =>
+        {
+            true
+        }
+        _ => false,
+    }
 }
 
 pub(crate) async fn connect_forever(endpoint: Endpoint) -> ZmqResult<(FramedIo, Endpoint)> {
@@ -206,7 +241,7 @@ pub(crate) async fn connect_forever(endpoint: Endpoint) -> ZmqResult<(FramedIo, 
     loop {
         match transport::connect(&endpoint).await {
             Ok(res) => return Ok(res),
-            Err(ZmqError::Network(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            Err(e) if is_retryable_connect_error(&endpoint, &e) => {
                 if try_num < 5 {
                     try_num += 1;
                 }
@@ -333,5 +368,26 @@ pub(crate) mod tests {
             Err(ZmqError::Other(_)) => {}
             _ => panic!("Unexpected result"),
         }
+    }
+
+    #[test]
+    fn retryable_connect_errors_include_refused_and_missing_ipc_socket() {
+        let tcp = Endpoint::Tcp(Host::Ipv4("127.0.0.1".parse().unwrap()), 5555);
+        let ipc = Endpoint::Ipc(Some("missing.sock".into()));
+        let missing_tcp = ZmqError::Network(std::io::Error::from(ErrorKind::NotFound));
+
+        assert!(is_retryable_connect_error(
+            &tcp,
+            &ZmqError::Network(std::io::Error::from(ErrorKind::ConnectionRefused))
+        ));
+        assert!(is_retryable_connect_error(
+            &ipc,
+            &ZmqError::Network(std::io::Error::from(ErrorKind::ConnectionRefused))
+        ));
+        assert!(is_retryable_connect_error(
+            &ipc,
+            &ZmqError::Network(std::io::Error::from(ErrorKind::NotFound))
+        ));
+        assert!(!is_retryable_connect_error(&tcp, &missing_tcp));
     }
 }
