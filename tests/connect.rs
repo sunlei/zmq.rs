@@ -2,7 +2,7 @@ use zeromq::__async_rt as async_rt;
 use zeromq::prelude::*;
 use zeromq::{SocketOptions, ZmqError, ZmqMessage};
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn unique_ipc_endpoint(name: &str) -> (String, PathBuf) {
@@ -10,7 +10,7 @@ fn unique_ipc_endpoint(name: &str) -> (String, PathBuf) {
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
         .as_nanos();
-    let path = Path::new("/tmp").join(format!("z-{name}-{}-{nanos}.sock", std::process::id()));
+    let path = std::env::temp_dir().join(format!("z-{name}-{}-{nanos}.sock", std::process::id()));
     (format!("ipc://{}", path.display()), path)
 }
 
@@ -75,6 +75,30 @@ async fn connect_timeout_expires_for_missing_ipc_socket() {
         .expect_err("connect should time out");
 
     assert!(matches!(err, ZmqError::ConnectTimeout(_)), "{err:?}");
+}
+
+#[async_rt::test]
+async fn ipc_close_allows_rebinding_same_path() {
+    let (endpoint, path) = unique_ipc_endpoint("rebind");
+
+    let mut first = zeromq::RouterSocket::new();
+    let first_bound = first.bind(&endpoint).await.unwrap();
+    assert_eq!(first_bound.to_string(), endpoint);
+
+    let errs = first.close().await;
+    assert!(errs.is_empty(), "Could not unbind first socket: {:?}", errs);
+
+    let mut second = zeromq::RouterSocket::new();
+    let second_bound = second.bind(&endpoint).await.unwrap();
+    assert_eq!(second_bound.to_string(), endpoint);
+
+    let errs = second.close().await;
+    assert!(
+        errs.is_empty(),
+        "Could not unbind second socket: {:?}",
+        errs
+    );
+    let _ = std::fs::remove_file(path);
 }
 
 #[async_rt::test]
