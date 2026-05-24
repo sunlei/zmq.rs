@@ -4,7 +4,7 @@ use std::error::Error;
 use std::io::Write;
 use std::time::Instant;
 
-use zeromq::{Socket, SocketRecv, SocketSend};
+use zeromq::{Socket, SocketRecv};
 
 #[async_helpers::main]
 async fn main() -> Result<(), Box<dyn Error>> {

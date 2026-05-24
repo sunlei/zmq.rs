@@ -3,7 +3,7 @@
 //! Tests identity-based routing between zmq.rs and libzmq implementations.
 
 mod compliance;
-use compliance::{get_monitor_event, setup_monitor};
+use compliance::{get_monitor_event, join_thread, setup_monitor};
 
 use zeromq::__async_rt as async_rt;
 use zeromq::prelude::*;
@@ -58,6 +58,9 @@ mod test {
         let ctx = zmq2::Context::new();
         let identity = b"dealer-identity-1";
         let (their_dealer, _their_monitor) = setup_their_dealer(&ctx, &bind_endpoint, identity);
+        their_dealer
+            .set_rcvtimeo(3000)
+            .expect("Failed to set dealer recv timeout");
 
         // Allow connection and handshake to complete
         async_rt::task::sleep(Duration::from_millis(200)).await;
@@ -98,7 +101,7 @@ mod test {
             our_router.send(reply).await.expect("Failed to send");
         }
 
-        dealer_handle.join().expect("Dealer thread panicked");
+        join_thread(dealer_handle, Duration::from_secs(5), "dealer thread").await;
     }
 
     // =========================================================================
@@ -207,6 +210,9 @@ mod test {
                 .set_identity(identity.as_bytes())
                 .expect("Failed to set identity");
             their_dealer
+                .set_rcvtimeo(3000)
+                .expect("Failed to set dealer recv timeout");
+            their_dealer
                 .connect(&bind_endpoint)
                 .expect("Failed to connect");
 
@@ -244,7 +250,7 @@ mod test {
         }
 
         for handle in dealer_handles {
-            handle.join().expect("Dealer thread panicked");
+            join_thread(handle, Duration::from_secs(5), "dealer thread").await;
         }
     }
 }

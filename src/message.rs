@@ -19,6 +19,12 @@ pub struct ZmqMessage {
 }
 
 impl ZmqMessage {
+    pub(crate) fn from_decoded_single_frame(frame: Bytes) -> Self {
+        let mut frames = VecDeque::with_capacity(2);
+        frames.push_back(frame);
+        Self { frames }
+    }
+
     pub fn push_back(&mut self, frame: Bytes) {
         self.frames.push_back(frame);
     }
@@ -97,9 +103,9 @@ impl From<Vec<u8>> for ZmqMessage {
 
 impl From<Bytes> for ZmqMessage {
     fn from(b: Bytes) -> Self {
-        Self {
-            frames: vec![b].into(),
-        }
+        let mut frames = VecDeque::with_capacity(1);
+        frames.push_back(b);
+        Self { frames }
     }
 }
 

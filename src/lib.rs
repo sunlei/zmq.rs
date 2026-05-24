@@ -20,6 +20,7 @@ mod sub_backend;
 mod task_handle;
 mod transport;
 pub mod util;
+mod write_queue;
 mod xpub;
 mod xsub;
 
@@ -238,6 +239,17 @@ pub trait SocketRecv {
 
 #[async_trait]
 pub trait SocketSend {
+    /// Sends one message according to the socket type's send policy.
+    ///
+    /// For sockets backed by an internal writer queue, such as PUSH, DEALER,
+    /// and ROUTER, `Ok(())` means the message has entered the local per-peer
+    /// queue. It does not mean the message has been flushed to the transport,
+    /// received by the peer, or processed by the peer.
+    ///
+    /// PUB sockets have weaker completion semantics: `Ok(())` means the
+    /// message has entered the local fanout path, or was dropped by PUB's
+    /// normal drop policy when the local fanout queue or subscriber queue is
+    /// full.
     async fn send(&mut self, message: ZmqMessage) -> ZmqResult<()>;
 }
 
