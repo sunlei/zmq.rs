@@ -5,7 +5,7 @@ use super::Message;
 use crate::ZmqMessage;
 
 use asynchronous_codec::{Decoder, Encoder};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 
 use std::convert::TryFrom;
 
@@ -98,11 +98,20 @@ impl Decoder for ZmqCodec {
                 if frame.command {
                     return Ok(Some(Message::Command(ZmqCommand::try_from(data.freeze())?)));
                 }
+                let data = data.freeze();
+
+                if self.buffered_message.is_none() && !frame.more {
+                    return Ok(Some(Message::Message(
+                        ZmqMessage::from_decoded_single_frame(data),
+                    )));
+                }
 
                 // process incoming message frame
                 match &mut self.buffered_message {
-                    Some(v) => v.push_back(data.freeze()),
-                    None => self.buffered_message = Some(ZmqMessage::from(data.freeze())),
+                    Some(v) => v.push_back(data),
+                    None => {
+                        self.buffered_message = Some(ZmqMessage::from_decoded_single_frame(data));
+                    }
                 }
 
                 if frame.more {
@@ -129,14 +138,13 @@ fn encode_frame(frame: &Bytes, dst: &mut BytesMut, more: bool) {
     if len > 255 {
         flags |= 0b0000_0010;
         dst.reserve(len + 9);
+        let mut header = [0u8; 9];
+        header[0] = flags;
+        header[1..].copy_from_slice(&(len as u64).to_be_bytes());
+        dst.extend_from_slice(&header);
     } else {
         dst.reserve(len + 2);
-    }
-    dst.put_u8(flags);
-    if len > 255 {
-        dst.put_u64(len as u64);
-    } else {
-        dst.put_u8(len as u8);
+        dst.extend_from_slice(&[flags, len as u8]);
     }
     dst.extend_from_slice(frame.as_ref());
 }
@@ -209,5 +217,58 @@ pub(crate) mod tests {
             }
             _ => panic!("wrong message type"),
         }
+    }
+
+    #[test]
+    pub fn test_single_frame_message_decode_without_buffering() {
+        let mut bytes = BytesMut::from(&[0x00, 0x03, b'a', b'b', b'c'][..]);
+        let mut codec = ZmqCodec::new();
+        codec.waiting_for = 1;
+        codec.state = DecoderState::FrameHeader;
+
+        let message = codec
+            .decode(&mut bytes)
+            .expect("decode success")
+            .expect("single message");
+
+        match message {
+            Message::Message(m) => {
+                assert_eq!(1, m.len());
+                assert_eq!(Some(&Bytes::from_static(b"abc")), m.get(0));
+            }
+            _ => panic!("wrong message type"),
+        }
+        assert!(bytes.is_empty());
+        assert!(codec.buffered_message.is_none());
+    }
+
+    #[test]
+    pub fn test_short_message_encode_uses_compact_header() {
+        let mut codec = ZmqCodec::new();
+        let mut bytes = BytesMut::new();
+        let message = ZmqMessage::from(Bytes::from_static(b"abc"));
+
+        codec
+            .encode(Message::Message(message), &mut bytes)
+            .expect("encode success");
+
+        assert_eq!(bytes.as_ref(), &[0x00, 0x03, b'a', b'b', b'c']);
+    }
+
+    #[test]
+    pub fn test_long_message_encode_uses_8_byte_length_header() {
+        let mut codec = ZmqCodec::new();
+        let mut bytes = BytesMut::new();
+        let payload = Bytes::from(vec![0x5a; 256]);
+        let message = ZmqMessage::from(payload.clone());
+
+        codec
+            .encode(Message::Message(message), &mut bytes)
+            .expect("encode success");
+
+        assert_eq!(bytes.len(), 9 + payload.len());
+        assert_eq!(bytes[0], 0b0000_0010);
+        assert_eq!(&bytes[1..9], &(payload.len() as u64).to_be_bytes());
+        assert_eq!(&bytes[9..], payload.as_ref());
     }
 }
