@@ -4,23 +4,48 @@ use crate::error::ZmqResult;
 use crate::message::*;
 use crate::transport::AcceptStopHandle;
 use crate::util::PeerIdentity;
+use crate::write_queue::write_message_queue;
 use crate::{async_rt, CaptureSocket, SocketOptions};
 use crate::{MultiPeerBackend, Socket, SocketBackend, SocketEvent, SocketSend, SocketType};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::channel::{mpsc, oneshot};
-use futures::lock::Mutex as AsyncMutex;
-use futures::{select, FutureExt, SinkExt, StreamExt};
+use futures::{select, FutureExt, StreamExt};
 use parking_lot::Mutex;
 
 use std::collections::HashMap;
-use std::io::ErrorKind;
-use std::pin::Pin;
 use std::sync::Arc;
+
+const PUB_SEND_QUEUE_CAPACITY: usize = 100_000;
+type PubSendQueue = mpsc::Sender<Message>;
+
+fn subscription_matches(subscriptions: &[Vec<u8>], first_frame: &Bytes) -> bool {
+    subscriptions.iter().any(|sub_filter| {
+        sub_filter.len() <= first_frame.len()
+            && sub_filter.as_slice() == &first_frame[0..sub_filter.len()]
+    })
+}
+
+fn send_to_subscriber(mut send_queue: PubSendQueue, message: &ZmqMessage) {
+    let message = Message::Message(message.clone());
+    match send_queue.try_send(message) {
+        Ok(()) => {}
+        Err(error) if error.is_full() => {
+            // PUB drops messages for slow subscribers so one full queue does not backpressure all publishers.
+            drop(error.into_inner());
+        }
+        Err(error) => {
+            // The writer task owns transport error detection and subscriber cleanup.
+            // A closed local queue is treated as a dropped PUB message on this send path.
+            drop(error.into_inner());
+        }
+    }
+}
 
 pub(crate) struct Subscriber {
     pub(crate) subscriptions: Vec<Vec<u8>>,
-    pub(crate) send_queue: Arc<AsyncMutex<Pin<Box<ZmqFramedWrite>>>>,
+    pub(crate) send_queue: PubSendQueue,
     _subscription_coro_stop: oneshot::Sender<()>,
 }
 
@@ -94,17 +119,30 @@ impl MultiPeerBackend for PubSocketBackend {
     async fn peer_connected(self: Arc<Self>, peer_id: &PeerIdentity, io: FramedIo) {
         let (mut recv_queue, send_queue) = io.into_parts();
         // TODO provide handling for recv_queue
+        let (queue_sender, queue_receiver) = mpsc::channel(PUB_SEND_QUEUE_CAPACITY);
         let (sender, stop_receiver) = oneshot::channel();
         self.subscribers
             .upsert_async(
                 peer_id.clone(),
                 Subscriber {
                     subscriptions: vec![],
-                    send_queue: Arc::new(AsyncMutex::new(Box::pin(send_queue))),
+                    send_queue: queue_sender,
                     _subscription_coro_stop: sender,
                 },
             )
             .await;
+        let writer_backend = self.clone();
+        let writer_peer_id = peer_id.clone();
+        async_rt::task::spawn(async move {
+            if let Err(error) = write_message_queue(queue_receiver, send_queue).await {
+                log::debug!(
+                    "Error sending message to subscriber {:?}: {:?}",
+                    writer_peer_id,
+                    error
+                );
+                writer_backend.peer_disconnected(&writer_peer_id);
+            }
+        });
         let backend = self;
         let peer_id = peer_id.clone();
         async_rt::task::spawn(async move {
@@ -161,43 +199,12 @@ impl SocketSend for PubSocket {
             Some(frame) => frame,
             None => return Ok(()), // Empty message, nothing to publish
         };
-        let mut targets = Vec::new();
         let mut iter = self.backend.subscribers.begin_async().await;
         while let Some(subscriber) = iter {
-            if subscriber.subscriptions.iter().any(|sub_filter| {
-                sub_filter.len() <= first_frame.len()
-                    && sub_filter.as_slice() == &first_frame[0..sub_filter.len()]
-            }) {
-                targets.push((subscriber.key().clone(), subscriber.send_queue.clone()));
+            if subscription_matches(&subscriber.subscriptions, first_frame) {
+                send_to_subscriber(subscriber.send_queue.clone(), &message);
             }
             iter = subscriber.next_async().await;
-        }
-
-        let mut dead_peers = Vec::new();
-        for (peer_id, send_queue) in targets {
-            let res = send_queue
-                .lock()
-                .await
-                .as_mut()
-                .send(Message::Message(message.clone()))
-                .await;
-            match res {
-                Ok(()) => {}
-                Err(CodecError::Io(e)) => {
-                    if e.kind() == ErrorKind::BrokenPipe {
-                        dead_peers.push(peer_id);
-                    } else {
-                        log::error!("Error sending message: {:?}", e);
-                    }
-                }
-                Err(e) => {
-                    log::error!("Error sending message: {:?}", e);
-                    return Err(e.into());
-                }
-            }
-        }
-        for peer in dead_peers {
-            self.backend.peer_disconnected(&peer);
         }
         Ok(())
     }
@@ -241,6 +248,187 @@ mod tests {
     };
     use crate::ZmqResult;
     use std::net::IpAddr;
+
+    fn test_backend() -> PubSocketBackend {
+        PubSocketBackend {
+            subscribers: scc::HashMap::new(),
+            socket_monitor: Mutex::new(None),
+            socket_options: SocketOptions::default(),
+        }
+    }
+
+    async fn insert_test_subscriber(
+        backend: &PubSocketBackend,
+        peer_id: PeerIdentity,
+        subscriptions: Vec<Vec<u8>>,
+        queue_sender: PubSendQueue,
+    ) {
+        let (stop_sender, _stop_receiver) = oneshot::channel();
+        backend
+            .subscribers
+            .upsert_async(
+                peer_id,
+                Subscriber {
+                    subscriptions,
+                    send_queue: queue_sender,
+                    _subscription_coro_stop: stop_sender,
+                },
+            )
+            .await;
+    }
+
+    #[async_rt::test]
+    async fn test_pub_send_queues_only_matching_subscribers() {
+        let mut socket = PubSocket::new();
+        let matching_peer = PeerIdentity::new();
+        let non_matching_peer = PeerIdentity::new();
+        let (matching_sender, mut matching_receiver) = mpsc::channel(8);
+        let (non_matching_sender, mut non_matching_receiver) = mpsc::channel(8);
+
+        insert_test_subscriber(
+            socket.backend.as_ref(),
+            matching_peer,
+            vec![b"topic.a".to_vec()],
+            matching_sender,
+        )
+        .await;
+        insert_test_subscriber(
+            socket.backend.as_ref(),
+            non_matching_peer,
+            vec![b"topic.b".to_vec()],
+            non_matching_sender,
+        )
+        .await;
+
+        <PubSocket as SocketSend>::send(
+            &mut socket,
+            ZmqMessage::from(Bytes::from_static(b"topic.a payload")),
+        )
+        .await
+        .expect("publish message");
+
+        let matched = matching_receiver.try_recv().expect("matching subscriber");
+        let Message::Message(matched) = matched else {
+            panic!("unexpected queued message type");
+        };
+        assert_eq!(
+            matched.get(0),
+            Some(&Bytes::from_static(b"topic.a payload"))
+        );
+        assert!(non_matching_receiver.try_recv().is_err());
+    }
+
+    #[async_rt::test]
+    async fn test_closed_subscriber_queue_does_not_interrupt_fanout_to_matching_peer() {
+        let mut socket = PubSocket::new();
+        let stale_peer = PeerIdentity::new();
+        let live_peer = PeerIdentity::new();
+        let (stale_sender, stale_receiver) = mpsc::channel(1);
+        let (live_sender, mut live_receiver) = mpsc::channel(8);
+        drop(stale_receiver);
+
+        insert_test_subscriber(
+            socket.backend.as_ref(),
+            stale_peer.clone(),
+            vec![vec![]],
+            stale_sender,
+        )
+        .await;
+        insert_test_subscriber(
+            socket.backend.as_ref(),
+            live_peer.clone(),
+            vec![vec![]],
+            live_sender,
+        )
+        .await;
+
+        <PubSocket as SocketSend>::send(
+            &mut socket,
+            ZmqMessage::from(Bytes::from_static(b"payload")),
+        )
+        .await
+        .expect("publish with stale subscriber");
+
+        let queued = live_receiver.try_recv().expect("live subscriber message");
+        let Message::Message(message) = queued else {
+            panic!("unexpected queued message type");
+        };
+        assert_eq!(message.get(0), Some(&Bytes::from_static(b"payload")));
+
+        assert!(socket.backend.subscribers.get_sync(&stale_peer).is_some());
+        assert!(socket.backend.subscribers.get_sync(&live_peer).is_some());
+    }
+
+    #[async_rt::test]
+    async fn test_full_subscriber_queue_drops_message_without_disconnect() {
+        let backend = test_backend();
+        let peer_id = PeerIdentity::new();
+        let (mut queue_sender, mut queue_receiver) = mpsc::channel(1);
+
+        insert_test_subscriber(
+            &backend,
+            peer_id.clone(),
+            vec![vec![]],
+            queue_sender.clone(),
+        )
+        .await;
+
+        let mut prefilled_count = 0;
+        loop {
+            let message = Message::Message(ZmqMessage::from(format!(
+                "already queued {prefilled_count}"
+            )));
+            match queue_sender.try_send(message) {
+                Ok(()) => prefilled_count += 1,
+                Err(error) if error.is_full() => {
+                    drop(error.into_inner());
+                    break;
+                }
+                Err(error) => panic!("unexpected queue prefill error: {error:?}"),
+            }
+        }
+        assert!(prefilled_count > 0);
+
+        send_to_subscriber(queue_sender, &ZmqMessage::from("dropped payload"));
+
+        assert!(backend.subscribers.get_sync(&peer_id).is_some());
+
+        let mut queued_messages = Vec::new();
+        while let Ok(queued) = queue_receiver.try_recv() {
+            let Message::Message(message) = queued else {
+                panic!("unexpected queued message type");
+            };
+            queued_messages.push(String::try_from(message).unwrap());
+        }
+
+        assert_eq!(queued_messages.len(), prefilled_count);
+        assert!(queued_messages
+            .iter()
+            .all(|message| message.starts_with("already queued ")));
+        assert!(!queued_messages
+            .iter()
+            .any(|message| message == "dropped payload"));
+    }
+
+    #[async_rt::test]
+    async fn test_send_to_subscriber_drops_closed_queue_without_disconnect() {
+        let backend = test_backend();
+        let peer_id = PeerIdentity::new();
+        let (queue_sender, queue_receiver) = mpsc::channel(1);
+        drop(queue_receiver);
+
+        insert_test_subscriber(
+            &backend,
+            peer_id.clone(),
+            vec![vec![]],
+            queue_sender.clone(),
+        )
+        .await;
+
+        send_to_subscriber(queue_sender, &ZmqMessage::from("payload"));
+
+        assert!(backend.subscribers.get_sync(&peer_id).is_some());
+    }
 
     #[async_rt::test]
     async fn test_bind_to_any_port() -> ZmqResult<()> {
