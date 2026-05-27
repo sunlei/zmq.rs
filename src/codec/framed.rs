@@ -19,7 +19,7 @@ impl<T> FrameableWrite for T where T: AsyncWrite + Unpin + Send + Sync {}
 
 pub(crate) type ZmqFramedWrite = asynchronous_codec::FramedWrite<Box<dyn FrameableWrite>, ZmqCodec>;
 
-const INITIAL_READ_CHUNK_SIZE: usize = 64;
+const INITIAL_READ_CHUNK_SIZE: usize = 128;
 const MAX_READ_CHUNK_SIZE: usize = 64 * 1024;
 
 /// ZMTP framed reader with an adaptive read chunk.
@@ -266,6 +266,7 @@ mod tests {
         let frame = vec![b'a'; 600];
         let requested_sizes = Arc::new(Mutex::new(Vec::new()));
         let input = encoded_stream(&[&frame]);
+        let input_len = input.len();
         let mut reader = ZmqFramedRead::new(Box::new(RecordingReader::new(
             input,
             Arc::clone(&requested_sizes),
@@ -286,6 +287,13 @@ mod tests {
         };
         assert_eq!(message.get(0), Some(&Bytes::copy_from_slice(&frame)));
 
-        assert_eq!(*requested_sizes.lock().unwrap(), vec![64, 128, 481]);
+        let greeting_len = BytesMut::from(ZmqGreeting::default()).len();
+        let encoded_frame_len = input_len - greeting_len;
+        let initial_prefetched_frame_bytes = INITIAL_READ_CHUNK_SIZE - greeting_len;
+        let remaining_frame_bytes = encoded_frame_len - initial_prefetched_frame_bytes;
+        assert_eq!(
+            *requested_sizes.lock().unwrap(),
+            vec![INITIAL_READ_CHUNK_SIZE, remaining_frame_bytes]
+        );
     }
 }
